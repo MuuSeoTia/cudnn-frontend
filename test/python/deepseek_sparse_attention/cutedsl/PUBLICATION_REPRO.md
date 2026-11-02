@@ -21,111 +21,59 @@ This change covers the BF16 Q/K shared mainloop and its indexer/attention
 callers. The MXFP8/MXFP4 kernels have separate implementations and are outside
 this qualification; their per-head synchronization needs a separate audit.
 
-## Runtime
+## Run
 
-Use Linux, Python 3.12, a Blackwell SM100-family GPU and Compute Sanitizer.
-The qualification uses Torch 2.13.0+cu130, CuTe DSL 4.8.1 (CUDA 13.4),
-cuda-bindings 13.4.4, apache-tvm-ffi 0.1.12, NumPy 1.26.4, cuDNN 9.22.0.52,
-pytest 8.4.2 and pytest-xdist 3.8.0. Install these in a dedicated environment.
-Compute Sanitizer was 2026.3.0.0, build 38855100.
-Torch's package metadata pins cuDNN 9.20.0.48; 9.22.0.52 is an explicit
-`--no-deps` override in this measured environment.
-
-The commands below use the official `nvidia-cudnn-frontend==1.32.1` wheel's
-native extension with the checkout's Python sources. This qualifies the Python
-kernel change, not a fresh C++ extension build. Keep the wheel installed in the
-environment and avoid an editable install pointing at another checkout.
-
-## Prepare the two source trees
-
-From a fresh clone of the committed review branch:
+From the review checkout on Linux with a Blackwell SM100-family GPU, a working
+CUDA 13-capable driver, Python 3.12 (including `venv`), and `compute-sanitizer`
+on `PATH`:
 
 ```bash
-base=f243150ad4079311da2c59497e9a1b514efd91ae
-fixed=$(pwd)
-baseline="${fixed}-baseline"
-git worktree add --detach "$baseline" "$base"
-
-# Copy only the new test into the unfixed tree, never its kernel implementation.
-git diff "$base" HEAD -- test/python/deepseek_sparse_attention/cutedsl/test_DSA_indexer_forward.py > "${fixed}-publication-test.patch"
-git -C "$baseline" apply "${fixed}-publication-test.patch"
-
-# Resolve the installed wheel before selecting either source overlay.
-binding=$(env -u PYTHONPATH python -c 'import cudnn, pathlib; print(next(pathlib.Path(cudnn.__file__).parent.glob("_compiled_module*.so")))')
-cp "$binding" "$fixed/python/cudnn/"
-cp "$binding" "$baseline/python/cudnn/"
-export CUDNN_FRONTEND_DISABLE_COMPILED_CACHE=1
-export CUDNN_FRONTEND_COMPILED_CACHE_INPROCESS_MEMO=0
-export CUTE_DSL_LINEINFO=1
-export OMP_NUM_THREADS=1
+bash test/python/deepseek_sparse_attention/cutedsl/reproduce_publication.sh
 ```
 
-Select a tree explicitly for each run. Read `cuDNN Frontend Path:` in pytest's
-banner and verify that the concrete kernel also resolves there:
+The script creates a fresh virtualenv, installs pinned public packages, downloads
+and checks the exact NVIDIA main archive, prepares isolated source trees, and
+runs all four suites below. Allow internet access and disk space for several GB
+of Python/CUDA packages. Compute Sanitizer 2026.3.0.0 was used for qualification.
 
-```bash
-tree="$baseline"  # repeat with "$fixed"
-export PYTHONPATH="$tree/python:$tree/test/python"
-cd "$tree/test/python"
-python -c 'import cudnn; import cudnn.deepseek_sparse_attention.score_recompute.dense_score_recompute_sm100 as k; print(cudnn.__file__, k.__file__, sep="\n")'
-```
+Results go to a new `dsa-publication-*` directory. Its `reports/` contains the
+installation log, resolved packages, source hashes, exact commands, exit codes,
+raw logs, JUnit XML and per-run runtime records. The script exits nonzero if any
+required check fails or skips. Expected racecheck failures on the unfixed code
+count as success only when the numerical tests pass and the reported source
+locations match the publication conflict. Hazard counts can vary by GPU.
+Each test process has a one-hour limit; a timeout stops qualification and keeps
+its logs and receipt.
 
-## FP32 support on the baseline
+Optional arguments: `--output /path/to/new-directory`,
+`--suite fp32|publication|attention|shared` (default: all), and `--existing-env`
+to use an already prepared Python environment. Set `PYTHON` or
+`COMPUTE_SANITIZER` to select executables outside `PATH`; `--help` lists options.
+`--source-archive` accepts an offline copy of the pinned NVIDIA codeload archive.
 
-These tests are unchanged from `main`. The additional publication test is not
-selected, and the baseline kernel is unmodified.
+## Independent checks
 
-```bash
-dsa=deepseek_sparse_attention/cutedsl
-python -m pytest -n 0 -m 'L0 or L1' -v -ra \
-  "$dsa/test_DSA_indexer_forward.py::test_DSA_indexer_forward_wrapper" \
-  "$dsa/test_DSA_indexer_forward.py::test_DSA_indexer_forward_wrapper_thd_varlen_tails" \
-  "$dsa/test_DSA_indexer_forward.py::test_DSA_indexer_forward_class_head_weight_contract" \
-  "$dsa/test_DSA_indexer_forward_compressed.py::test_DSA_compressed_indexer_forward_bshd_preallocated_lse" \
-  "$dsa/test_DSA_indexer_forward_compressed.py::test_DSA_compressed_indexer_forward_thd_preallocated_global_indices"
-```
+| Suite | Source and acceptance |
+| --- | --- |
+| `fp32` | 36 existing FP32/BF16, cache-order, packed and compressed cases on pristine main |
+| `publication` | Same six cases on main plus the regression test, then on the kernel fix; numerics, racecheck and synccheck |
+| `attention` | Two existing dense/packed attention cases on both versions under the same three checks |
+| `shared` | 39 existing shared-mainloop cases on the fix, with 44 unrelated cases deselected |
 
-## Publication RED/GREEN
+The six publication cases cover BF16/FP32 W, partial tiles, persistent slot reuse
+and tiles with no visible keys. They use a chunked FP64 oracle, repeated calls
+and changed W. The script checks that the baseline overlay changes only the
+test file and that the fixed tree differs only in the kernel file. It verifies
+imported package/kernel paths and disables compiled caches in every child.
 
-Run each command in both trees with the same environment. The six cases cover
-BF16/FP32 W, partial tiles, persistent slot reuse and tiles with no visible keys.
-They compare against a chunked FP64 oracle, repeat the call, and change W.
-The unfixed racecheck run must fail with shared W publication hazards; the fixed
-run must pass. A failed import, skipped suite or numerical failure is not RED
-evidence for the synchronization bug.
-
-```bash
-case=deepseek_sparse_attention/cutedsl/test_DSA_indexer_forward.py::test_DSA_indexer_forward_per_head_publication
-python -m pytest -n 0 -m 'L0 or L1' -v -ra "$case"
-compute-sanitizer --tool racecheck --report-api-errors extended --error-exitcode 86 \
-  python -m pytest -n 0 -m 'L0 or L1' -v -ra "$case"
-compute-sanitizer --tool synccheck --report-api-errors extended --error-exitcode 86 \
-  python -m pytest -n 0 -m 'L0 or L1' -v -ra "$case"
-```
-
-## Shared-mainloop coverage
-
-In the fixed tree, run existing BF16 dense attention/indexer and packed and
-compressed indexer tests. Inspect skips as well as pytest's final summary.
-
-```bash
-dsa=deepseek_sparse_attention/cutedsl
-python -m pytest -n 0 -m 'L0 or L1' -v -ra \
-  -k 'not mxfp8 and not mxfp4 and not sm90' \
-  "$dsa/test_DSA_dense_score_recompute.py" \
-  "$dsa/test_DSA_indexer_forward.py::test_DSA_indexer_forward_wrapper_thd_varlen_tails" \
-  "$dsa/test_DSA_indexer_forward_compressed.py::test_DSA_compressed_indexer_forward_bshd_preallocated_lse" \
-  "$dsa/test_DSA_indexer_forward_compressed.py::test_DSA_compressed_indexer_forward_thd_preallocated_global_indices"
-```
-
-For focused attention sanitizer coverage, run these two existing cases in both
-trees, directly and under the same racecheck/synccheck prefixes above:
-
-```bash
-python -m pytest -n 0 -m 'L0 or L1' -v -ra \
-  'deepseek_sparse_attention/cutedsl/test_DSA_dense_score_recompute.py::test_DSA_dense_score_recompute_wrapper[attention-32-128-acc_dtype0-dtype0]' \
-  'deepseek_sparse_attention/cutedsl/test_DSA_dense_score_recompute.py::test_DSA_dense_score_recompute_thd_execute_uses_plan_envelope[attention]'
-```
+Pinned runtime: Torch 2.13.0, CuTe DSL 4.8.1 (CUDA 13.4), cuda-bindings 13.4.4,
+apache-tvm-ffi 0.1.12, NumPy 1.26.4, cuDNN 9.22.0.52, pytest 8.4.2,
+pytest-xdist 3.8.0, looseversion 1.3.0 and certifi 2026.10.23 (source-download
+CA bundle, also needed with `--existing-env`). The script explicitly overrides
+Torch's cuDNN 9.20 dependency
+with `--no-deps` to match the measured runtime. It uses the official Frontend
+1.32.1 wheel's native extension with isolated checkout Python sources; it does
+not build the C++ extension.
 
 ## Recorded source-recreation result
 
@@ -145,3 +93,9 @@ between unfixed and fixed arms. GB300 SM103 (152 SMs), runtime above:
 
 No selected case skipped. These are kernel/API correctness results, not model
 accuracy or performance measurements.
+
+The one-command entry point reproduced this table on 2026-11-02 with a fresh
+virtualenv and online source download, using only `--output`. All 14 processes
+met their acceptance criteria in 1,097 seconds on GB300, with no selected-test
+skips. The executed script's SHA256 was
+`069b33878c13d26a42775c4329fcddb0e6db06493e3a76ce6b8da9e8458687b4`.
