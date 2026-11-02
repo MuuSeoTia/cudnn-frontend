@@ -27,6 +27,7 @@ Use Linux, Python 3.12, a Blackwell SM100-family GPU and Compute Sanitizer.
 The qualification uses Torch 2.13.0+cu130, CuTe DSL 4.8.1 (CUDA 13.4),
 cuda-bindings 13.4.4, apache-tvm-ffi 0.1.12, NumPy 1.26.4, cuDNN 9.22.0.52,
 pytest 8.4.2 and pytest-xdist 3.8.0. Install these in a dedicated environment.
+Compute Sanitizer was 2026.3.0.0, build 38855100.
 Torch's package metadata pins cuDNN 9.20.0.48; 9.22.0.52 is an explicit
 `--no-deps` override in this measured environment.
 
@@ -116,3 +117,31 @@ python -m pytest -n 0 -m 'L0 or L1' -v -ra \
   "$dsa/test_DSA_indexer_forward_compressed.py::test_DSA_compressed_indexer_forward_bshd_preallocated_lse" \
   "$dsa/test_DSA_indexer_forward_compressed.py::test_DSA_compressed_indexer_forward_thd_preallocated_global_indices"
 ```
+
+For focused attention sanitizer coverage, run these two existing cases in both
+trees, directly and under the same racecheck/synccheck prefixes above:
+
+```bash
+python -m pytest -n 0 -m 'L0 or L1' -v -ra \
+  'deepseek_sparse_attention/cutedsl/test_DSA_dense_score_recompute.py::test_DSA_dense_score_recompute_wrapper[attention-32-128-acc_dtype0-dtype0]' \
+  'deepseek_sparse_attention/cutedsl/test_DSA_dense_score_recompute.py::test_DSA_dense_score_recompute_thd_execute_uses_plan_envelope[attention]'
+```
+
+## Recorded source-recreation result
+
+On 2026-11-02, a fresh clone supplied the base archive and the committed
+kernel/test changes. The source manifests differed only by the kernel file
+between unfixed and fixed arms. GB300 SM103 (152 SMs), runtime above:
+
+| Check | Unfixed | Fixed |
+| --- | --- | --- |
+| Existing FP32/BF16 support tests | 36 passed | Independent baseline check |
+| Publication numerics | 6 passed | 6 passed |
+| Publication racecheck | 126 errors, 100 displayed hazards | 0 errors |
+| Focused attention numerics | 2 passed | 2 passed |
+| Focused attention racecheck | 8 errors | 0 errors |
+| Synccheck, publication and focused attention | 0 errors | 0 errors |
+| Shared-mainloop suite | Not selected | 39 passed, 44 deselected |
+
+No selected case skipped. These are kernel/API correctness results, not model
+accuracy or performance measurements.
